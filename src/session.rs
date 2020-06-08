@@ -452,7 +452,7 @@ impl fmt::Display for Input {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Key(k) => write!(f, "{}", k),
-            Self::Character(c) => write!(f, "'{}'", c),
+            Self::Character(c) => write!(f, "{}", c),
         }
     }
 }
@@ -494,7 +494,15 @@ impl KeyBinding {
                         || state == InputState::Released
                         || key.is_modifier())
             }
-            (Input::Character(a), Input::Character(b)) => a == b,
+            (Input::Character(a), Input::Character(b)) => {
+                // Nb. We only check the <ctrl> modifier with characters,
+                // because the others (especially <shift>) will most likely
+                // input a different character.
+                a == b
+                    && self.modes.contains(&mode)
+                    && self.state == state
+                    && self.modifiers.ctrl == modifiers.ctrl
+            }
             _ => false,
         }
     }
@@ -508,23 +516,7 @@ pub struct KeyBindings {
 
 impl Default for KeyBindings {
     fn default() -> Self {
-        // The only default is 'help'.
-        KeyBindings {
-            elems: vec![KeyBinding {
-                modes: vec![Mode::Normal, Mode::Help],
-                modifiers: ModifiersState {
-                    shift: true,
-                    ctrl: false,
-                    alt: false,
-                    meta: false,
-                },
-                input: Input::Key(platform::Key::Slash),
-                state: InputState::Pressed,
-                command: Command::Mode(Mode::Help),
-                is_toggle: false,
-                display: Some("?".to_string()),
-            }],
-        }
+        KeyBindings { elems: vec![] }
     }
 }
 

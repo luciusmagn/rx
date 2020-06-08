@@ -169,7 +169,8 @@ impl fmt::Display for Command {
             Self::ForceQuitAll => write!(f, "Quit all views without saving"),
             Self::Map(_) => write!(f, "Map a key combination to a command"),
             Self::MapClear => write!(f, "Clear all key mappings"),
-            Self::Mode(m) => write!(f, "Switch session mode to {}", m),
+            Self::Mode(Mode::Help) => write!(f, "Toggle help"),
+            Self::Mode(m) => write!(f, "Switch to {} mode", m),
             Self::FrameAdd => write!(f, "Add a blank frame to the view"),
             Self::FrameClone(i) => write!(f, "Clone frame {} and add it to the view", i),
             Self::FrameRemove => write!(f, "Remove the last frame of the view"),
@@ -332,7 +333,7 @@ impl KeyMapping {
             .skip(whitespace())
             .then(press)
             .skip(optional(whitespace()))
-            .then(optional(between('{', '}', release).label("{<cmd>}")));
+            .then(optional(between('{', '}', release)));
 
         character
             .or(key)
@@ -342,6 +343,7 @@ impl KeyMapping {
                 release,
                 modes: modes.clone(),
             })
+            .label("<key> <cmd>") // TODO: We should provide the full command somehow.
     }
 }
 
