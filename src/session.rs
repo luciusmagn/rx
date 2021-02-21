@@ -6,13 +6,15 @@ use crate::color;
 use crate::data;
 use crate::event::{Event, TimedEvent};
 use crate::execution::{DigestMode, DigestState, Execution};
+use crate::flood::FloodFiller;
 use crate::hashmap;
 use crate::palette::*;
 use crate::platform::{self, InputState, Key, KeyboardInput, LogicalSize, ModifiersState};
-use crate::resources::{Edit, EditId, Pixels, ResourceManager};
 use crate::util;
 use crate::view::layer::{LayerCoords, LayerId};
 use crate::view::path;
+use crate::view::pixels::Pixels;
+use crate::view::resource::{Edit, EditId, ViewResource};
 use crate::view::{
     self, FileStatus, FileStorage, View, ViewCoords, ViewExtent, ViewId, ViewManager, ViewOp,
     ViewState,
@@ -28,7 +30,6 @@ use arrayvec::ArrayVec;
 use directories as dirs;
 use nonempty::NonEmpty;
 
-use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::convert::TryFrom;
 use std::fmt;
@@ -37,7 +38,6 @@ use std::io;
 use std::io::Write;
 use std::ops::{Add, Deref, Sub};
 use std::path::{Path, PathBuf};
-use std::rc::Rc;
 use std::time;
 
 /// Settings help string.
@@ -300,6 +300,8 @@ pub enum State {
 pub enum Tool {
     /// The standard drawing tool.
     Brush(Brush),
+    /// Used for filling enclosed regions with color.
+    FloodFill,
     /// Used to sample colors.
     Sampler,
     /// Used to pan the workspace.
@@ -703,9 +705,6 @@ pub struct Session {
     /// User directories.
     base_dirs: dirs::BaseDirs,
 
-    /// Resources shared with the `Renderer`.
-    resources: ResourceManager,
-
     /// Whether we should ignore characters received.
     ignore_received_characters: bool,
     /// The set of keys currently pressed.
@@ -722,7 +721,7 @@ pub struct Session {
     pub settings_changed: HashSet<String>,
 
     /// Views loaded in the session.
-    pub views: ViewManager,
+    pub views: ViewManager<ViewResource>,
     /// Effects produced by the session. Cleared at the beginning of every
     /// update.
     pub effects: Vec<Effect>,
@@ -798,7 +797,6 @@ impl Session {
         w: u32,
         h: u32,
         cwd: P,
-        resources: ResourceManager,
         proj_dirs: dirs::ProjectDirs,
         base_dirs: dirs::BaseDirs,
     ) -> Self {
@@ -835,7 +833,6 @@ impl Session {
             prev_mode: Option::default(),
             selection: Option::default(),
             message: Message::default(),
-            resources,
             avg_time: time::Duration::from_secs(0),
             frame_number: 0,
             queue: Vec::new(),
@@ -911,7 +908,7 @@ impl Session {
     pub fn update(
         &mut self,
         events: &mut Vec<Event>,
-        exec: Rc<RefCell<Execution>>,
+        exec: &mut Execution,
         delta: time::Duration,
         avg_time: time::Duration,
     ) -> Vec<Effect> {
@@ -930,8 +927,6 @@ impl Session {
         if self.ignore_received_characters {
             self.ignore_received_characters = false;
         }
-
-        let exec = &mut *exec.borrow_mut();
 
         // TODO: This whole block needs refactoring..
         if let Execution::Replaying {
@@ -1204,10 +1199,16 @@ impl Session {
         self.palette.handle_cursor_moved(cursor);
         self.hover_view = None;
 
+        let gained_palette_focus = !palette_hover && self.palette.hover.is_some();
+
         match &self.tool {
             Tool::Brush(b) if !b.is_drawing() => {
-                if !palette_hover && self.palette.hover.is_some() {
-                    // Gained palette focus with brush.
+                if gained_palette_focus {
+                    self.tool(Tool::Sampler);
+                }
+            }
+            Tool::FloodFill => {
+                if gained_palette_focus {
                     self.tool(Tool::Sampler);
                 }
             }
@@ -1352,7 +1353,7 @@ impl Session {
     /// # Panics
     ///
     /// Panics if the view isn't found.
-    pub fn view(&self, id: ViewId) -> &View {
+    pub fn view(&self, id: ViewId) -> &View<ViewResource> {
         self.views
             .get(id)
             .expect(&format!("view #{} must exist", id))
@@ -1363,7 +1364,7 @@ impl Session {
     /// # Panics
     ///
     /// Panics if the view isn't found.
-    pub fn view_mut(&mut self, id: ViewId) -> &mut View {
+    pub fn view_mut(&mut self, id: ViewId) -> &mut View<ViewResource> {
         self.views
             .get_mut(id)
             .expect(&format!("view #{} must exist", id))
@@ -1374,7 +1375,7 @@ impl Session {
     /// # Panics
     ///
     /// Panics if there is no active view.
-    pub fn active_view(&self) -> &View {
+    pub fn active_view(&self) -> &View<ViewResource> {
         assert!(
             self.views.active_id != ViewId::default(),
             "fatal: no active view"
@@ -1387,7 +1388,7 @@ impl Session {
     /// # Panics
     ///
     /// Panics if there is no active view.
-    pub fn active_view_mut(&mut self) -> &mut View {
+    pub fn active_view_mut(&mut self) -> &mut View<ViewResource> {
         assert!(
             self.views.active_id != ViewId::default(),
             "fatal: no active view"
@@ -1510,10 +1511,11 @@ impl Session {
     /// loads all files within that directory.
     ///
     /// If a path doesn't exist, creates a blank view for that path.
-    pub fn edit<P: AsRef<Path>>(&mut self, paths: &[P]) -> io::Result<()> {
+    pub fn edit<P: AsRef<Path>>(&mut self, paths: &[P]) -> io::Result<(usize, usize)> {
         use std::ffi::OsStr;
 
-        // TODO: Keep loading paths even if some fail?
+        let (mut success_count, mut fail_count) = (0usize, 0usize);
+
         for path in paths {
             let path = path.as_ref();
 
@@ -1525,30 +1527,39 @@ impl Session {
                     if path.is_dir() {
                         continue;
                     }
+
                     if path.file_name() == Some(OsStr::new(".rxrc")) {
                         continue;
                     }
 
-                    self.load_view(path)?;
+                    if let Err(_) = self.load_view(path) {
+                        fail_count += 1;
+                        continue;
+                    }
+
+                    success_count += 1;
                 }
                 self.source_dir(path).ok();
-            } else if path.exists() {
-                self.load_view(path)?;
-            } else if !path.exists() && path.with_extension("png").exists() {
-                self.load_view(path.with_extension("png"))?;
             } else {
-                let (w, h) = if !self.views.is_empty() {
-                    let v = self.active_view();
-                    (v.width(), v.height())
+                if path.exists() {
+                    self.load_view(path)?;
+                } else if !path.exists() && path.with_extension("png").exists() {
+                    self.load_view(path.with_extension("png"))?;
                 } else {
-                    (Self::DEFAULT_VIEW_W, Self::DEFAULT_VIEW_H)
-                };
-                self.blank(
-                    FileStatus::New(FileStorage::Single(path.with_extension("png"))),
-                    w,
-                    h,
-                );
-            }
+                    let (w, h) = if !self.views.is_empty() {
+                        let v = self.active_view();
+                        (v.width(), v.fh)
+                    } else {
+                        (Self::DEFAULT_VIEW_W, Self::DEFAULT_VIEW_H)
+                    };
+                    self.blank(
+                        FileStatus::New(FileStorage::Single(path.with_extension("png"))),
+                        w,
+                        h,
+                    );
+                }
+                success_count += 1;
+            } 
         }
 
         if let Some(id) = self.views.last().map(|v| v.id) {
@@ -1556,7 +1567,7 @@ impl Session {
             self.edit_view(id);
         }
 
-        Ok(())
+        Ok((success_count, fail_count))
     }
 
     /// Load the given paths into the session as frames in a new view.
@@ -1603,7 +1614,7 @@ impl Session {
         // Load images and collect errors.
         let mut frames = paths
             .iter()
-            .map(ResourceManager::load_image)
+            .map(crate::io::load_image)
             .collect::<io::Result<Vec<_>>>()?
             .into_iter()
             .peekable();
@@ -1656,16 +1667,27 @@ impl Session {
 
         match &storage {
             FileStorage::Single(path) if nlayers > 1 => {
-                let written = self.resources.save_view_archive(id, path)?;
-                let edit_id = self.resources.lock().current_edit(id);
+                {
+                    let mut path_copy = path.clone();
+                    path_copy.pop();
+                    std::fs::create_dir_all(path_copy.as_path())?;
+                }
+                let view = self.view(id);
+                let written = view.resource.save_archive(path)?;
+                let cursor = view.resource.cursor;
 
-                self.view_mut(id).save_as(edit_id, storage.clone());
+                self.view_mut(id).save_as(cursor, storage.clone());
                 self.message(
                     format!("\"{}\" {} pixels written", storage, written),
                     MessageType::Info,
                 );
             }
             FileStorage::Single(path) => {
+                {
+                    let mut path_copy = path.clone();
+                    path_copy.pop();
+                    std::fs::create_dir_all(path_copy.as_path())?;
+                }
                 if let Some(s_id) =
                     self.save_layer_rect_as(id, active_layer_id, ext.rect(), &path)?
                 {
@@ -1685,7 +1707,7 @@ impl Session {
                     self.save_layer_rect_as(id, active_layer_id, ext.frame(i), path)?;
                 }
 
-                let edit_id = self.resources.lock().current_edit(id);
+                let edit_id = self.view(id).resource.current_edit();
                 self.view_mut(id).save_as(edit_id, storage.clone());
                 self.message(
                     format!(
@@ -1754,7 +1776,7 @@ impl Session {
             ));
         }
 
-        let (e_id, _) = self.resources.save_layer(id, layer_id, rect, &path)?;
+        let (e_id, _) = self.view(id).save_layer(layer_id, rect, &path)?;
 
         Ok(Some(e_id))
     }
@@ -1779,7 +1801,7 @@ impl Session {
 
         match path.format {
             view::Format::Png => {
-                let (width, height, pixels) = ResourceManager::load_image(&*path)?;
+                let (width, height, pixels) = crate::io::load_image(&*path)?;
 
                 self.add_view(
                     FileStatus::Saved(FileStorage::Single((*path).into())),
@@ -1793,7 +1815,7 @@ impl Session {
                 );
             }
             view::Format::Archive => {
-                let archive = ResourceManager::load_archive(&*path)?;
+                let archive = crate::io::load_archive(&*path)?;
                 let extent = archive.manifest.extent;
                 let mut layers = archive.layers.into_iter();
 
@@ -1827,18 +1849,7 @@ impl Session {
     }
 
     fn add_layer(&mut self, view_id: ViewId, pixels: Option<Pixels>) {
-        let l = self.view_mut(view_id).add_layer();
-        let v = self.view(view_id);
-
-        self.resources
-            .lock_mut()
-            .get_view_mut(v.id)
-            .expect(&format!("view #{} must exist", v.id))
-            .add_layer(
-                l,
-                v.extent(),
-                pixels.unwrap_or(Pixels::blank(v.width() as usize, v.height() as usize)),
-            );
+        self.view_mut(view_id).add_layer(pixels);
     }
 
     fn add_view(
@@ -1862,14 +1873,16 @@ impl Session {
 
         let pixels = util::stitch_frames(frames, fw as usize, fh as usize, Rgba8::TRANSPARENT);
         let delay = self.settings["animation/delay"].to_u64();
-        let id = self.views.add(file_status, fw, fh, nframes, delay);
+        let resource = ViewResource::new(
+            Pixels::from_rgba8(pixels.into()),
+            ViewExtent::new(fw, fh, nframes),
+        );
+        let id = self
+            .views
+            .add(file_status, fw, fh, nframes, delay, resource);
 
         self.effects.push(Effect::ViewAdded(id));
-        self.resources.add_view(
-            id,
-            ViewExtent::new(fw, fh, nframes),
-            Pixels::from_rgba8(pixels.into()),
-        );
+
         id
     }
 
@@ -1878,7 +1891,6 @@ impl Session {
         assert!(!self.views.is_empty());
 
         self.views.remove(id);
-        self.resources.remove_view(id);
         self.effects.push(Effect::ViewRemoved(id));
     }
 
@@ -1915,9 +1927,7 @@ impl Session {
     ) -> io::Result<()> {
         let delay = self.view(id).animation.delay;
         let palette = self.colors();
-        let npixels = self
-            .resources
-            .save_view_gif(id, layer_id, &path, delay, &palette)?;
+        let npixels = self.view(id).save_gif(layer_id, &path, delay, &palette)?;
 
         self.message(
             format!("\"{}\" {} pixels written", path.as_ref().display(), npixels),
@@ -1933,7 +1943,7 @@ impl Session {
         layer_id: LayerId,
         path: P,
     ) -> io::Result<()> {
-        let npixels = self.resources.save_view_svg(id, layer_id, &path)?;
+        let npixels = self.view(id).save_svg(layer_id, &path)?;
 
         self.message(
             format!("\"{}\" {} pixels written", path.as_ref().display(), npixels),
@@ -1968,20 +1978,17 @@ impl Session {
 
         first.offset.y = 0.;
 
-        // TODO: We need a way to distinguish view content size with real (rendered) size. Also
-        // create a distinction between layer and view height. Right now `View::height` is layer
-        // height.
-        let mut offset =
-            (first.height() * first.layers.len() as u32) as f32 * first.zoom + Self::VIEW_MARGIN;
+        // TODO: We need a way to distinguish view content size with real (rendered) size.
+        let mut offset = first.height() as f32 * first.zoom + Self::VIEW_MARGIN;
 
         for v in self.views.iter_mut().skip(1) {
             if v.layers.len() > 1 {
                 // Account for layer composite.
-                offset += v.height() as f32 * v.zoom;
+                offset += v.fh as f32 * v.zoom;
             }
             v.offset.y = offset;
 
-            offset += (v.height() * v.layers.len() as u32) as f32 * v.zoom + Self::VIEW_MARGIN;
+            offset += v.height() as f32 * v.zoom + Self::VIEW_MARGIN;
         }
         self.cursor_dirty();
     }
@@ -2004,8 +2011,8 @@ impl Session {
             let v = self.active_view_mut();
             let s = s.abs().bounds();
 
-            if s.intersects(v.bounds()) {
-                let s = s.intersection(v.bounds());
+            if s.intersects(v.layer_bounds()) {
+                let s = s.intersection(v.layer_bounds());
 
                 v.yank(s);
 
@@ -2048,7 +2055,7 @@ impl Session {
     }
 
     fn restore_view_snapshot(&mut self, id: ViewId, dir: Direction) {
-        let result = self.resources.lock_mut().get_view_mut(id).and_then(|s| {
+        let result = self.views.get_mut(id).and_then(|s| {
             if dir == Direction::Backward {
                 s.history_prev()
             } else {
@@ -2068,7 +2075,7 @@ impl Session {
                     Direction::Forward => {
                         // TODO: This relies on the fact that `remove_layer` can
                         // only remove the last layer.
-                        let layer_id = self.view_mut(id).add_layer();
+                        let layer_id = self.view_mut(id).push_layer();
                         debug_assert!(layer_id == layer);
                     }
                 };
@@ -2242,6 +2249,16 @@ impl Session {
                                     self.sample_color();
                                 }
                                 Tool::Pan(_) => {}
+                                Tool::FloodFill => {
+                                    let start_time = time::Instant::now();
+                                    let filler =
+                                        FloodFiller::new(self.active_view(), p.into(), self.fg);
+                                    if let Some(shapes) = filler.and_then(|f| f.run()) {
+                                        self.effects.push(Effect::ViewPaintFinal(shapes));
+                                        self.active_view_mut().touch_layer();
+                                    }
+                                    debug!("flood fill in: {:?}", start_time.elapsed());
+                                }
                             },
                             Mode::Command => {
                                 // TODO
@@ -2322,7 +2339,7 @@ impl Session {
         let prev_cursor = self.cursor;
         let p = self.active_layer_coords(cursor);
         let prev_p = self.active_layer_coords(prev_cursor);
-        let (vw, vh) = self.active_view().size();
+        let (vw, vh) = self.active_view().layer_size();
 
         self.cursor = cursor;
         self.cursor_dirty();
@@ -2364,8 +2381,9 @@ impl Session {
                         }
                     }
                     Mode::Visual(VisualState::Selecting { dragging: true }) => {
-                        let view = self.active_view().bounds();
+                        let view = self.active_view().layer_bounds();
 
+                        // Resize selection.
                         if self.mouse_state == InputState::Pressed && p != prev_p {
                             if let Some(ref mut s) = self.selection {
                                 // TODO: (rgx) Better API.
@@ -2577,7 +2595,8 @@ impl Session {
     fn center_active_view_v(&mut self) {
         if let Some(v) = self.views.active() {
             self.offset.y =
-                (self.height / 2. - v.height() as f32 / 2. * v.zoom - v.offset.y).floor();
+                // TODO: This should center based on the total view height, not the frame height.
+                (self.height / 2. - v.fh as f32 / 2. * v.zoom - v.offset.y).floor();
             self.cursor_dirty();
         }
     }
@@ -2841,6 +2860,10 @@ impl Session {
             Command::PaletteClear => {
                 self.palette.clear();
             }
+            Command::PaletteGradient(colorstart, colorend, steps) => {
+                self.palette.gradient(colorstart, colorend, steps);
+                self.center_palette();
+            }
             Command::PaletteSort => {
                 // Sort by total luminosity. This is pretty lame, but it's
                 // something to work with.
@@ -2852,8 +2875,12 @@ impl Session {
             Command::PaletteSample => {
                 {
                     let v = self.active_view();
-                    let resources = self.resources.lock();
-                    let (_, pixels) = resources.get_snapshot(v.id, v.active_layer_id);
+                    let (_, pixels) = self
+                        .views
+                        .get(v.id)
+                        .expect(&format!("view #{} must exist", v.id))
+                        .layer(v.active_layer_id)
+                        .current_snapshot();
 
                     for pixel in pixels.iter() {
                         if pixel != Rgba8::TRANSPARENT {
@@ -2884,14 +2911,17 @@ impl Session {
             },
             Command::Zoom(op) => {
                 let center = if let Some(s) = self.selection {
-                    self.session_coords(
-                        self.views.active_id,
-                        s.bounds().center().map(|n| n as f32).into(),
-                    )
+                    let v = self.active_view();
+                    let coords = s.bounds().center().map(|n| n as f32)
+                        + v.layer_offset(v.active_layer_id, 1.);
+                    self.session_coords(v.id, coords.into())
                 } else if self.hover_view.is_some() {
                     self.cursor
                 } else {
-                    self.session_coords(self.views.active_id, self.active_view().center())
+                    self.session_coords(
+                        self.views.active_id,
+                        self.active_view().active_layer_center(),
+                    )
                 };
 
                 match op {
@@ -2980,6 +3010,7 @@ impl Session {
             Command::LayerRemove(id) => {
                 if let Some(id) = id {
                     self.active_view_mut().remove_layer(id);
+                    self.check_selection();
                     self.organize_views();
                 } else {
                     unimplemented!()
@@ -3063,8 +3094,23 @@ impl Session {
             Command::Edit(ref paths) => {
                 if paths.is_empty() {
                     self.unimplemented();
-                } else if let Err(e) = self.edit(paths) {
-                    self.message(format!("Error loading path(s): {}", e), MessageType::Error);
+                }
+
+                match self.edit(paths) {
+                    Ok((success_count, fail_count)) => {
+                        if success_count + fail_count > 1 {
+                            self.message(
+                                format!(
+                                    "{} path(s) loaded, {} skipped",
+                                    success_count, fail_count
+                                ),
+                                MessageType::Info,
+                            )
+                        }
+                    }
+                    Err(e) => {
+                        self.message(format!("Error loading path(s): {}", e), MessageType::Error)
+                    }
                 }
             }
             Command::EditFrames(ref paths) => {
@@ -3193,7 +3239,7 @@ impl Session {
             Command::SelectionExpand => {
                 let v = self.active_view();
                 let (fw, fh) = (v.fw as i32, v.fh as i32);
-                let (vw, vh) = (v.width() as i32, v.height() as i32);
+                let (vw, vh) = (v.width() as i32, v.fh as i32);
 
                 if let Some(ref mut selection) = self.selection {
                     let r = Rect::origin(vw, vh);
@@ -3236,6 +3282,7 @@ impl Session {
                 }
             }
             Command::SelectionJump(dir) => {
+                // TODO: Test this across layers.
                 let v = self.active_view();
                 let r = v.bounds();
                 let fw = v.extent().fw as i32;
@@ -3259,13 +3306,30 @@ impl Session {
                 self.yank_selection();
             }
             Command::SelectionFlip(dir) => {
-                self.flip_selection(dir);
-                // I think its handy to flip in place for now, hence these commands
-                // 1., 2. prevent overlap and paste
-                // 3.     preserve location so you can flip repeatedly w/ hotkey
-                self.command(Command::SelectionErase);
-                self.command(Command::SelectionPaste);
-                self.command(Command::Mode(Mode::Visual(VisualState::Selecting { dragging: false })));
+                if let (Mode::Visual(VisualState::Selecting { .. }), Some(s)) =
+                    (self.mode, self.selection)
+                {
+                    let v = self.active_view_mut();
+                    let s = s.abs().bounds();
+
+                    if s.intersects(v.layer_bounds()) {
+                        let s = s.intersection(v.layer_bounds());
+
+                        // The flip operation works by copying the flipped image into
+                        // the paste buffer, and pasting.
+                        v.flip(s, dir);
+                        v.paste(s);
+
+                        self.selection = Some(Selection::from(s));
+                        self.switch_mode(Mode::Visual(VisualState::Pasting));
+                    }
+                    // Note that the effects generated here will be processed *before* the
+                    // view operations.
+                    self.command(Command::SelectionErase);
+                    self.command(Command::Mode(Mode::Visual(VisualState::Selecting {
+                        dragging: false,
+                    })));
+                }
             }
             Command::SelectionCut => {
                 // To mimick the behavior of `vi`, we yank the selection
@@ -3304,6 +3368,13 @@ impl Session {
             }
             Command::PaintColor(rgba, x, y) => {
                 self.active_view_mut().paint_color(rgba, x, y);
+            }
+            Command::PaintLine(rgba, x1, y1, x2, y2) => {
+                let mut stroke = vec![];
+                Brush::line(Point2::new(x1, y1), Point2::new(x2, y2), &mut stroke);
+                for pt in stroke {
+                    self.active_view_mut().paint_color(rgba, pt.x, pt.y);
+                }
             }
             Command::PaintForeground(x, y) => {
                 let fg = self.fg;
@@ -3391,16 +3462,10 @@ impl Session {
     /// Get the color at the given view coordinate.
     pub fn color_at(&self, v: ViewId, l: LayerId, p: LayerCoords<u32>) -> Option<Rgba8> {
         let view = self.view(v);
-        let resources = self.resources.lock();
-        let (snapshot, pixels) = resources.get_snapshot(view.id, l);
-
-        let y_offset = snapshot
-            .height()
-            .checked_sub(p.y)
-            .and_then(|x| x.checked_sub(1));
-        let index = y_offset.map(|y| (y * snapshot.width() + p.x) as usize);
-
-        index.and_then(|idx| pixels.get(idx))
+        let (snapshot, pixels) = self.views.get_snapshot(view.id, l);
+        snapshot
+            .layer_coord_to_index(p)
+            .and_then(|idx| pixels.get(idx))
     }
 
     fn sample_color(&mut self) {

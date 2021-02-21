@@ -25,24 +25,20 @@ mod cmd;
 mod color;
 mod draw;
 mod event;
+mod flood;
 mod font;
 mod history;
 mod image;
+mod io;
 mod palette;
 mod parser;
 mod pixels;
 mod platform;
 mod renderer;
-mod resources;
 mod sprite;
 mod timer;
 mod view;
 
-#[cfg(feature = "wgpu")]
-#[path = "wgpu/mod.rs"]
-mod gfx;
-
-#[cfg(not(feature = "wgpu"))]
 #[path = "gl/mod.rs"]
 mod gfx;
 
@@ -54,7 +50,6 @@ use event::Event;
 use execution::{DigestMode, Execution, ExecutionMode, GifMode};
 use platform::{WindowEvent, WindowHint};
 use renderer::Renderer;
-use resources::ResourceManager;
 use session::*;
 use timer::FrameTimer;
 use view::FileStatus;
@@ -65,9 +60,7 @@ extern crate log;
 use directories as dirs;
 
 use std::alloc::System;
-use std::cell::RefCell;
 use std::path::{Path, PathBuf};
-use std::rc::Rc;
 use std::time::{Duration, Instant};
 
 /// Program version.
@@ -108,18 +101,17 @@ pub fn init<'a, P: AsRef<Path>>(paths: &[P], options: Options<'a>) -> std::io::R
 
     debug!("options: {:?}", options);
 
-    let context = if cfg!(feature = "wgpu") {
-        platform::GraphicsContext::None
-    } else {
-        platform::GraphicsContext::Gl
-    };
-
     let hints = &[
         WindowHint::Resizable(options.resizable),
         WindowHint::Visible(!options.headless),
     ];
-    let (mut win, mut events) =
-        platform::init("rx", options.width, options.height, hints, context)?;
+    let (mut win, mut events) = platform::init(
+        "rx",
+        options.width,
+        options.height,
+        hints,
+        platform::GraphicsContext::Gl,
+    )?;
 
     let scale_factor = win.scale_factor();
     let win_size = win.size();
@@ -128,14 +120,13 @@ pub fn init<'a, P: AsRef<Path>>(paths: &[P], options: Options<'a>) -> std::io::R
     info!("framebuffer size: {}x{}", win_size.width, win_size.height);
     info!("scale factor: {}", scale_factor);
 
-    let resources = ResourceManager::new();
     let assets = data::Assets::new(options.glyphs);
     let proj_dirs = dirs::ProjectDirs::from("io", "cloudhead", "rx")
         .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "config directory not found"))?;
     let base_dirs = dirs::BaseDirs::new()
         .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "home directory not found"))?;
     let cwd = std::env::current_dir()?;
-    let mut session = Session::new(win_w, win_h, cwd, resources.clone(), proj_dirs, base_dirs)
+    let mut session = Session::new(win_w, win_h, cwd, proj_dirs, base_dirs)
         .with_blank(
             FileStatus::NoFile,
             Session::DEFAULT_VIEW_W,
@@ -157,7 +148,7 @@ pub fn init<'a, P: AsRef<Path>>(paths: &[P], options: Options<'a>) -> std::io::R
             .expect("'vsync' is a bool");
     }
 
-    let exec = match options.exec {
+    let mut execution = match options.exec {
         ExecutionMode::Normal => Execution::normal(),
         ExecutionMode::Replay(path, digest) => Execution::replaying(path, digest),
         ExecutionMode::Record(path, digest, gif) => {
@@ -167,7 +158,7 @@ pub fn init<'a, P: AsRef<Path>>(paths: &[P], options: Options<'a>) -> std::io::R
 
     // When working with digests, certain settings need to be overwritten
     // to ensure things work correctly.
-    match &exec {
+    match &execution {
         Execution::Replaying { digest, .. } | Execution::Recording { digest, .. }
             if digest.mode != DigestMode::Ignore =>
         {
@@ -183,18 +174,11 @@ pub fn init<'a, P: AsRef<Path>>(paths: &[P], options: Options<'a>) -> std::io::R
         _ => {}
     }
 
-    let wait_events = exec.is_normal() || exec.is_recording();
-    let execution = Rc::new(RefCell::new(exec));
+    let wait_events = execution.is_normal() || execution.is_recording();
     let present_mode = session.settings.present_mode();
 
-    let mut renderer: gfx::Renderer = Renderer::new(
-        &mut win,
-        win_size,
-        scale_factor,
-        present_mode,
-        resources,
-        assets,
-    )?;
+    let mut renderer: gfx::Renderer =
+        Renderer::new(&mut win, win_size, scale_factor, present_mode, assets)?;
 
     if let Err(e) = session.edit(paths) {
         session.message(format!("Error loading path(s): {}", e), MessageType::Error);
@@ -202,44 +186,28 @@ pub fn init<'a, P: AsRef<Path>>(paths: &[P], options: Options<'a>) -> std::io::R
     // Make sure our session ticks once before anything is rendered.
     let effects = session.update(
         &mut vec![],
-        execution.clone(),
+        &mut execution,
         Duration::default(),
         Duration::default(),
     );
-    renderer.init(effects);
+    renderer.init(effects, &session);
 
     let mut render_timer = FrameTimer::new();
     let mut update_timer = FrameTimer::new();
     let mut session_events = Vec::with_capacity(16);
     let mut last = Instant::now();
+    let mut delta = Duration::from_secs(0);
     let mut resized = false;
     let mut hovering = false;
 
-    // Accumulated error from animation timeout.
-    let mut anim_accum = Duration::from_secs(0);
-
     while !win.is_closing() {
-        let start = Instant::now();
-
         match session.animation_delay() {
             Some(delay) if session.is_running() => {
-                if delay > anim_accum {
-                    events.wait_timeout(delay - anim_accum);
+                if delay.as_millis().saturating_sub(delta.as_millis()) >= 1 {
+                    events.wait_timeout(delay - delta);
                 } else {
                     events.poll();
                 }
-                // How much time has actually passed waiting for events.
-                let d = start.elapsed();
-
-                if d > delay {
-                    // If more time has passed than the desired animation delay, then
-                    // add the difference to our accumulated error.
-                    anim_accum += d - delay;
-                } else if delay > d {
-                    // If less time has passed than our desired delay, then
-                    // reset the accumulator to zero, because we've overshot.
-                    anim_accum = Duration::from_secs(0);
-                };
             }
             _ if wait_events => events.wait(),
             _ => events.poll(),
@@ -294,7 +262,11 @@ pub fn init<'a, P: AsRef<Path>>(paths: &[P], options: Options<'a>) -> std::io::R
                 }
                 WindowEvent::RedrawRequested => {
                     render_timer.run(|avg| {
-                        renderer.frame(&session, execution.clone(), vec![], &avg);
+                        renderer
+                            .frame(&mut session, &mut execution, vec![], &avg)
+                            .unwrap_or_else(|err| {
+                                log::error!("{}", err);
+                            });
                     });
                     win.present();
                 }
@@ -342,8 +314,8 @@ pub fn init<'a, P: AsRef<Path>>(paths: &[P], options: Options<'a>) -> std::io::R
             session.handle_resized(win.size());
         }
 
-        let delta = last.elapsed();
-        last = Instant::now();
+        delta = last.elapsed();
+        last += delta;
 
         // If we're paused, we want to keep the timer running to not get a
         // "jump" when we unpause, but skip session updates and rendering.
@@ -351,11 +323,15 @@ pub fn init<'a, P: AsRef<Path>>(paths: &[P], options: Options<'a>) -> std::io::R
             continue;
         }
 
-        let effects = update_timer
-            .run(|avg| session.update(&mut session_events, execution.clone(), delta, avg));
+        let effects =
+            update_timer.run(|avg| session.update(&mut session_events, &mut execution, delta, avg));
 
         render_timer.run(|avg| {
-            renderer.frame(&session, execution.clone(), effects, &avg);
+            renderer
+                .frame(&mut session, &mut execution, effects, &avg)
+                .unwrap_or_else(|err| {
+                    log::error!("{}", err);
+                });
         });
 
         session.cleanup();

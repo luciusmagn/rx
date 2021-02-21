@@ -7,7 +7,9 @@ use rgx::kit::{Rgba8, ZDepth};
 use rgx::math::{Point2, Vector2};
 use rgx::rect::Rect;
 
+use crate::util::vector_angle;
 use std::collections::BTreeSet;
+use std::f32::consts::PI;
 use std::fmt;
 
 /// Input state of the brush.
@@ -38,6 +40,11 @@ pub enum BrushMode {
     YSym,
     /// X-Ray mode.
     XRay,
+    /// Confine stroke to a straight line from the starting point
+    Line(
+        /// snap angle (degrees)
+        Option<u32>,
+    ),
 }
 
 impl fmt::Display for BrushMode {
@@ -49,6 +56,8 @@ impl fmt::Display for BrushMode {
             Self::XSym => "xsym".fmt(f),
             Self::YSym => "ysym".fmt(f),
             Self::XRay => "xray".fmt(f),
+            Self::Line(Some(snap)) => write!(f, "{} degree snap line", snap),
+            Self::Line(None) => write!(f, "line"),
         }
     }
 }
@@ -101,12 +110,21 @@ impl Brush {
 
     /// Activate the given brush mode.
     pub fn set(&mut self, m: BrushMode) -> bool {
+        if let BrushMode::Line(_) = m {
+            // only one line sub-mode may be active at a time
+            if let Some(line_mode) = self.line_mode() {
+                self.unset(line_mode);
+            }
+        }
         self.modes.insert(m)
     }
 
     /// De-activate the given brush mode.
     pub fn unset(&mut self, m: BrushMode) -> bool {
-        self.modes.remove(&m)
+        match self.line_mode() {
+            Some(line_mode) if matches!(m, BrushMode::Line(_)) => self.modes.remove(&line_mode),
+            _ => self.modes.remove(&m),
+        }
     }
 
     /// Toggle the given brush mode.
@@ -147,6 +165,15 @@ impl Brush {
         self.draw(p);
     }
 
+    /// If a line mode is active, return it
+    fn line_mode(&self) -> Option<BrushMode> {
+        self.modes
+            .iter()
+            .filter(|mode| matches!(mode, BrushMode::Line(_)))
+            .cloned()
+            .next()
+    }
+
     /// Draw. Called while input is pressed.
     pub fn draw(&mut self, p: LayerCoords<i32>) {
         self.prev = if let BrushState::DrawStarted(_) = self.state {
@@ -156,8 +183,29 @@ impl Brush {
         };
         self.curr = *p;
 
-        Brush::line(self.prev, self.curr, &mut self.stroke);
-        self.stroke.dedup();
+        if let Some(BrushMode::Line(snap)) = self.line_mode() {
+            let start = self.stroke.first().unwrap_or(&p).clone();
+            self.stroke.clear();
+
+            let end = match snap {
+                None => self.curr,
+                Some(snap) => {
+                    let snap_rad = snap as f32 * PI / 180.0;
+                    let curr: Vector2<f32> = self.curr.map(|x| x as f32).into();
+                    let start: Vector2<f32> = start.map(|x| x as f32).into();
+                    let dist = curr.distance(start);
+                    let angle = vector_angle(&curr, &start) - PI / 2.0;
+                    let round_angle = (angle / snap_rad).round() * snap_rad;
+                    let end = start + Vector2::new(round_angle.cos(), round_angle.sin()) * dist;
+                    Point2::new(end.x.round() as i32, end.y.round() as i32)
+                }
+            };
+
+            Brush::line(start, end, &mut self.stroke);
+        } else {
+            Brush::line(self.prev, self.curr, &mut self.stroke);
+            self.stroke.dedup();
+        }
 
         if self.is_set(BrushMode::Perfect) {
             self.stroke = Brush::filter(&self.stroke);
@@ -280,7 +328,7 @@ impl Brush {
     ///////////////////////////////////////////////////////////////////////////
 
     /// Draw a line between two points. Uses Bresenham's line algorithm.
-    fn line(mut p0: Point2<i32>, p1: Point2<i32>, canvas: &mut Vec<Point2<i32>>) {
+    pub fn line(mut p0: Point2<i32>, p1: Point2<i32>, canvas: &mut Vec<Point2<i32>>) {
         let dx = i32::abs(p1.x - p0.x);
         let dy = i32::abs(p1.y - p0.y);
         let sx = if p0.x < p1.x { 1 } else { -1 };

@@ -25,9 +25,9 @@ pub enum Op {
 }
 
 #[derive(Clone, Debug, PartialEq)]
-pub enum Flip {
-	Horizontal,
-	Vertical,
+pub enum Axis {
+    Horizontal,
+    Vertical,
 }
 
 /// User command. Most of the interactions available to
@@ -70,6 +70,7 @@ pub enum Command {
     // Palette
     PaletteAdd(Rgba8),
     PaletteClear,
+    PaletteGradient(Rgba8, Rgba8, usize),
     PaletteSample,
     PaletteSort,
     PaletteWrite(String),
@@ -84,6 +85,7 @@ pub enum Command {
     PaintForeground(i32, i32),
     PaintBackground(i32, i32),
     PaintPalette(usize, i32, i32),
+    PaintLine(Rgba8, i32, i32, i32, i32),
 
     // Selection
     SelectionMove(i32, i32),
@@ -96,7 +98,7 @@ pub enum Command {
     SelectionFill(Option<Rgba8>),
     SelectionErase,
     SelectionJump(Direction),
-    SelectionFlip(Flip),
+    SelectionFlip(Axis),
 
     // Settings
     Set(String, Value),
@@ -177,6 +179,13 @@ impl fmt::Display for Command {
             Self::Noop => write!(f, "No-op"),
             Self::PaletteAdd(c) => write!(f, "Add {color} to palette", color = c),
             Self::PaletteClear => write!(f, "Clear palette"),
+            Self::PaletteGradient(cs, ce, n) => write!(
+                f,
+                "Create {} colors gradient from {} to {}",
+                number = n,
+                colorstart = cs,
+                colorend = ce
+            ),
             Self::PaletteSample => write!(f, "Sample palette from view"),
             Self::PaletteSort => write!(f, "Sort palette colors"),
             Self::Pan(x, 0) if *x > 0 => write!(f, "Pan workspace right"),
@@ -191,6 +200,7 @@ impl fmt::Display for Command {
             Self::Tool(Tool::Pan(_)) => write!(f, "Pan tool"),
             Self::Tool(Tool::Brush(_)) => write!(f, "Brush tool"),
             Self::Tool(Tool::Sampler) => write!(f, "Color sampler tool"),
+            Self::Tool(Tool::FloodFill) => write!(f, "Flood fill tool"),
             Self::ToolPrev => write!(f, "Switch to previous tool"),
             Self::Set(s, v) => write!(f, "Set {setting} to {val}", setting = s, val = v),
             Self::Slice(Some(n)) => write!(f, "Slice view into {} frame(s)", n),
@@ -228,8 +238,8 @@ impl fmt::Display for Command {
                 write!(f, "Move selection backward by one frame")
             }
             Self::SelectionErase => write!(f, "Erase selection contents"),
-            Self::SelectionFlip(Flip::Horizontal) => write!(f, "Flip selection horizontally"),
-            Self::SelectionFlip(Flip::Vertical) => write!(f, "Flip selection vertically"),
+            Self::SelectionFlip(Axis::Horizontal) => write!(f, "Flip selection horizontally"),
+            Self::SelectionFlip(Axis::Vertical) => write!(f, "Flip selection vertically"),
             Self::PaintColor(_, x, y) => write!(f, "Paint {:2},{:2}", x, y),
             _ => write!(f, "..."),
         }
@@ -260,6 +270,7 @@ impl From<Command> for String {
             Command::PaletteClear => format!("p/clear"),
             Command::PaletteWrite(_) => format!("p/write"),
             Command::PaletteSample => format!("p/sample"),
+            Command::PaletteGradient(cs, ce, n) => format!("p/gradient {} {} {}", cs, ce, n),
             Command::Pan(x, y) => format!("pan {} {}", x, y),
             Command::Quit => format!("q"),
             Command::Redo => format!("redo"),
@@ -820,6 +831,9 @@ impl Default for Commands {
             .command("brush", "Switch to default brush", |p| {
                 p.value(Command::Tool(Tool::Brush(Brush::default())))
             })
+            .command("flood", "Switch to flood fill tool", |p| {
+                p.value(Command::Tool(Tool::FloodFill))
+            })
             .command("mode", "Set session mode, eg. `visual` or `normal`", |p| {
                 p.then(param::<Mode>()).map(|(_, m)| Command::Mode(m))
             })
@@ -882,6 +896,15 @@ impl Default for Commands {
             })
             .command("p/clear", "Clear the color palette", |p| {
                 p.value(Command::PaletteClear)
+            })
+            .command("p/gradient", "Add a gradient to the palette", |p| {
+                p.then(tuple::<Rgba8>(
+                    color().label("<colorstart>"),
+                    color().label("<colorend>"),
+                ))
+                .skip(whitespace())
+                .then(natural::<usize>())
+                .map(|((_, (cs, ce)), n)| Command::PaletteGradient(cs, ce, n))
             })
             .command(
                 "p/sample",
@@ -980,8 +1003,8 @@ impl Default for Commands {
             .command("selection/flip", "Flip selection", |p| {
                 p.then(word().label("h[orizontal]/v[ertical]"))
                     .try_map(|(_, t)| match t.as_str() {
-                        "horizontal" | "h" => Ok(Command::SelectionFlip(Flip::Horizontal)),
-                        "vertical" | "v" => Ok(Command::SelectionFlip(Flip::Vertical)),
+                        "horizontal" | "x" => Ok(Command::SelectionFlip(Axis::Horizontal)),
+                        "vertical" | "y" => Ok(Command::SelectionFlip(Axis::Vertical)),
                         _ => Err(format!("unknown direction {:?}", t)),
                     })
             })
@@ -990,6 +1013,22 @@ impl Default for Commands {
                     .skip(whitespace())
                     .then(tuple::<i32>(integer().label("<x>"), integer().label("<y>")))
                     .map(|((_, rgba), (x, y))| Command::PaintColor(rgba, x, y))
+            })
+            .command("paint/line", "Draw a line between two points", |p| {
+                p.then(color())
+                    .skip(whitespace())
+                    .then(tuple::<i32>(
+                        integer().label("<x1>"),
+                        integer().label("<y1>"),
+                    ))
+                    .skip(whitespace())
+                    .then(tuple::<i32>(
+                        integer().label("<x2>"),
+                        integer().label("<y2>"),
+                    ))
+                    .map(|(((_, color), (x1, y1)), (x2, y2))| {
+                        Command::PaintLine(color, x1, y1, x2, y2)
+                    })
             })
             .command("paint/fg", "Paint foreground color", |p| {
                 p.then(tuple::<i32>(integer().label("<x>"), integer().label("<y>")))
